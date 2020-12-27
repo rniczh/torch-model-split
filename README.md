@@ -7,7 +7,7 @@ Usage:
 ```python
 import modelsplit as ms
 
-model = ms.DataFlow(model)
+model = ms.DataFlow(model, output_device=0)
 
 # The default GPU for each layer is 0
 # You can change the layer by setting the layer_gpus in model
@@ -20,6 +20,6 @@ for key, value in model.layer_gpus.items():
 model.update_flow()
 
 # Execute the model
-input.to(device)
+input.to('cuda:0')
 model(input)
 ```
