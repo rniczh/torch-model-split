@@ -1,4 +1,4 @@
-from collections import OrderedDict 
+from collections import OrderedDict
 import types
 import ast
 import inspect
@@ -37,7 +37,7 @@ class _CudaMappingVisitor(ast.NodeVisitor):
                          args=[ast.Num(n=self.output_device)],
                          keywords=[], starargs=None, kwargs=None)
         node.value = value
-        
+
 
     #! currently, it only can deal with the layer call with only one argument
     def visit_Call(self, node):
@@ -49,7 +49,7 @@ class _CudaMappingVisitor(ast.NodeVisitor):
         #                       attr ='layer',
         #                       ctx  =Load()),
         #        args=[arg])
-        # => 
+        # =>
         #   Call(func=Attribute(value=Name(id='self', ctx=Load()),
         #                       attr ='layer',
         #                       ctx  =Load()),
@@ -59,7 +59,7 @@ class _CudaMappingVisitor(ast.NodeVisitor):
         #                   args=[Num(n=device_id)]
         #             ])
         func = node.func
-        if (len(node.args) == 1 and  # TODO, release the restrict of one argument 
+        if (len(node.args) == 1 and  # TODO, release the restrict of one argument
             isinstance(func, ast.Attribute) and
             isinstance(func.ctx, ast.Load)  and
             isinstance(func.value, ast.Name)):
@@ -80,7 +80,7 @@ class _CudaMappingVisitor(ast.NodeVisitor):
                 node.args = [new_arg]
 
 class DataFlow(Module):
-    def __init__(self, module, device_ids=None, output_device=None, dim=0):
+    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False):
         super(DataFlow, self).__init__()
 
         device_type = _get_available_device_type()
@@ -103,8 +103,9 @@ class DataFlow(Module):
         self.src_device_obj = torch.device(device_type, self.device_ids[0])
 
         # because inference only, so disable the gradient in model
-        for param in self.module.parameters():
-            param.requires_grad=False
+        if inference_only == True:
+            for param in self.module.parameters():
+                param.requires_grad=False
 
         if len(self.device_ids) == 1:
             self.module.to(self.src_device_obj)
@@ -142,7 +143,3 @@ class DataFlow(Module):
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
-
-
-
-    
