@@ -20,6 +20,6 @@ for key, value in model.layer_gpus.items():
 model.update_flow()
 
 # Execute the model
-input.to('cuda:0')
+input = input.cuda(0)
 model(input)
 ```
