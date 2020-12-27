@@ -5,9 +5,9 @@ This script can automatically put the layers of a single model to different GPUs
 Usage:
 
 ```python
-import cf
+import modelsplit as ms
 
-model = cf.DataFlow(model)
+model = ms.DataFlow(model)
 
 # The default GPU for each layer is 0
 # You can change the layer by setting the layer_gpus in model
