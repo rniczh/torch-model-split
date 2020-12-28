@@ -124,7 +124,7 @@ class DataFlow(Module):
         for name, module in self.module.named_children():
             module.cuda(self.layer_gpus[name])
 
-        if clear_cache:
+        if self.clear_cache:
             torch.cuda.empty_cache()
 
         # get the forward source code and convert it into AST
