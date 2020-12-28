@@ -80,7 +80,7 @@ class _CudaMappingVisitor(ast.NodeVisitor):
                 node.args = [new_arg]
 
 class DataFlow(Module):
-    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False):
+    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True):
         super(DataFlow, self).__init__()
 
         device_type = _get_available_device_type()
@@ -101,9 +101,10 @@ class DataFlow(Module):
         self.device_ids = list(map(lambda x: _get_device_index(x, True), device_ids))
         self.output_device = _get_device_index(output_device, True)
         self.src_device_obj = torch.device(device_type, self.device_ids[0])
+        self.clear_cache = clear_cache
 
         # because inference only, so disable the gradient in model
-        if inference_only == True:
+        if inference_only:
             for param in self.module.parameters():
                 param.requires_grad=False
 
@@ -122,6 +123,9 @@ class DataFlow(Module):
         # update the submodule gpus
         for name, module in self.module.named_children():
             module.cuda(self.layer_gpus[name])
+
+        if clear_cache:
+            torch.cuda.empty_cache()
 
         # get the forward source code and convert it into AST
         source = textwrap.dedent(inspect.getsource(self.module.forward))
