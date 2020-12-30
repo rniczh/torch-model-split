@@ -68,7 +68,9 @@ class _CudaMappingVisitor(ast.NodeVisitor):
             arg   = node.args[0]
 
             # check weather it is belong to model
-            if value.id == 'self' and isinstance(value.ctx, ast.Load):
+            if (value.id == 'self' and
+                attr in self.layer_gpus and
+                isinstance(value.ctx, ast.Load)):
                 # get the layer device id
                 device_id = self.layer_gpus[attr]
                 new_arg=ast.Call(func=ast.Attribute(value=arg,
