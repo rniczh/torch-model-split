@@ -4,8 +4,6 @@ import ast
 import inspect
 import copy
 import textwrap
-import astunparse
-import torch.multiprocessing as mp
 
 import torch
 from torch.nn.modules import Module
