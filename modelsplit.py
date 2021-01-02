@@ -41,7 +41,9 @@ class _ChildMappingVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         ast.NodeVisitor.generic_visit(self, node)
-        self.data.update([t.id for t in node.targets])
+        for t in node.targets:
+            if isinstance(t, ast.Name):
+                self.data.add(t.id)
 
     def visit_Call(self, node):
         ast.NodeVisitor.generic_visit(self, node)
@@ -54,7 +56,6 @@ class _ChildMappingVisitor(ast.NodeVisitor):
             isinstance(func.value, ast.Name)):
             value = func.value
             attr  = func.attr
-            arg   = node.args[0]
 
             # check weather it is belong to model
             if (value.id == 'self' and
@@ -62,11 +63,6 @@ class _ChildMappingVisitor(ast.NodeVisitor):
                 isinstance(value.ctx, ast.Load)):
                 # get the layer device id
                 device_id = self.layer_gpus[attr]
-                new_arg=ast.Call(func=ast.Attribute(value=arg,
-                                                    attr='cuda',
-                                                    ctx=ast.Load()),
-                                 args=[ast.Num(n=device_id)],
-                                 keywords=[], starargs=None, kwargs=None)
 
                 # upate args
                 node.args = [ ast.Call(func=ast.Attribute(value=arg,
@@ -74,7 +70,8 @@ class _ChildMappingVisitor(ast.NodeVisitor):
                                                           ctx=ast.Load()),
                                        args=[ast.Num(n=device_id)],
                                        keywords=[], starargs=None, kwargs=None)
-                              if arg.id in self.data else arg for arg in node.args ]
+                              if isinstance(arg, ast.Name) and
+                              arg.id in self.data else arg for arg in node.args ]
 
         
 class _FineGrainedMappingVisitor(ast.NodeVisitor):
@@ -88,15 +85,6 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
         self.instance_type = ''
         self.data = set()
 
-    def visit_List(self, node):
-        if isinstance(node.ctx, ast.Load):
-            node.elts = [ ast.Call(func=ast.Attribute(value=arg,
-                                                      attr='cuda',
-                                                      ctx=ast.Load()),
-                                   args=[ast.Num(n=device_id)],
-                                   keywords=[], starargs=None, kwargs=None)
-                          if elt in self.data else elt for elt in node.elts ]
-
     def visit_FunctionDef(self, node):
         for arg in node.args.args:
             if arg.arg != 'self':
@@ -104,10 +92,12 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
 
         for arg_name in self.data:
             device_id = self.operator_gpus[self.instance_type] \
-                        if self.focus_operator else self.layer_gpus[self.instance_name]
-            
+                        if self.focus_operator \
+                           else self.layer_gpus[self.instance_name]
+                
             value = ast.Call(func=ast.Attribute(value=
-                                                ast.Name(id=arg_name, ctx=ast.Load()),
+                                                ast.Name(id=arg_name,
+                                                         ctx=ast.Load()),
                                                 attr='cuda',
                                                 ctx=ast.Load()),
                              args=[ast.Num(n=device_id)],
@@ -116,13 +106,16 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
             target = ast.Name(id=arg_name, ctx=ast.Store())
             assignment = ast.Assign(targets=[target], value=value)
             node.body.insert(0, assignment)
-            
+
         ast.NodeVisitor.generic_visit(self, node)
         self.data.clear()
 
     def visit_Assign(self, node):
         ast.NodeVisitor.generic_visit(self, node)
-        self.data.update(node.targets)
+        for t in node.targets:
+            if isinstance(t, ast.Name):
+                self.data.add(t.id)
+
         
 class DataFlow(Module):
     def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True, fine_grained=False, focus_operator=False):
@@ -141,7 +134,6 @@ class DataFlow(Module):
         if output_device is None:
             output_device = device_ids[0]
 
-        self.split_size = 20
         self.dim = dim
         self.module = module
         self.device_ids = list(map(lambda x: _get_device_index(x, True), device_ids))
@@ -176,6 +168,7 @@ class DataFlow(Module):
                 self.layer_gpus[n] = self.output_device
 
         self.old_forward = copy.deepcopy(self.module.forward)
+
 
     def _modify_forward(self, visitor, name, module):
         # get the forward source code and convert it into AST
@@ -221,10 +214,21 @@ class DataFlow(Module):
             for n, m in self.module.named_modules():
                 if not n or len(m._modules) != 0:
                     continue
+
                 fv.instance_name = n
                 fv.instance_type = type(m).__name__
                 m.forward = self._modify_forward(fv, n, m)
-             
+
+            # modify torch.cat
+            namespace = self.module.forward.__globals__
+            copy_cat = copy.deepcopy(namespace['torch'].cat)
+
+            def torch_cat(arg, *args):
+                arg = [x.cuda(self.output_device) for x in arg]
+                return copy_cat(arg, *args)
+
+            namespace['torch'].cat = copy.deepcopy(torch_cat)
+                
         cv = _ChildMappingVisitor(layer_gpus=self.layer_gpus,
                                   output_device=self.output_device)
         self.module.forward = self._modify_forward(cv, "main", self.module)
