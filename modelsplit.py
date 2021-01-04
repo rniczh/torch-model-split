@@ -14,14 +14,21 @@ from torch._utils import (
 )
 
 class _ChildMappingVisitor(ast.NodeVisitor):
-    def __init__(self, output_device=None, layer_gpus=OrderedDict()):
+    def __init__(self, module=None, output_device=None, layer_gpus=OrderedDict(), is_fine=False, old_functions={}):
         super(_ChildMappingVisitor)
         self.layer_gpus = layer_gpus
         self.output_device = output_device
         self.data = set()
+        self.module = module
+        self.is_fine = is_fine
+        self.no_modify_return=False
+        self.old_functions = old_functions
 
     def visit_Return(self, node):
         ast.NodeVisitor.generic_visit(self, node)
+
+        if self.no_modify_return:
+            return
 
         # processing return val => return val.cuda(output_device)
 
@@ -29,7 +36,8 @@ class _ChildMappingVisitor(ast.NodeVisitor):
                                             attr='cuda',
                                             ctx=ast.Load()),
                          args=[ast.Num(n=self.output_device)],
-                         keywords=[], starargs=None, kwargs=None)
+                         keywords=[ast.keyword(arg='non_blocking',
+                                               value=ast.NameConstant(value=True))], starargs=None, kwargs=None)
         node.value = value
         
     def visit_FunctionDef(self, node):
@@ -48,6 +56,8 @@ class _ChildMappingVisitor(ast.NodeVisitor):
     def visit_Call(self, node):
         ast.NodeVisitor.generic_visit(self, node)
 
+        if self.is_fine:
+            return 
         # processing self.layer(arg ...) => self.layer(arg.cuda(device_id) ...)
 
         func = node.func
@@ -69,11 +79,35 @@ class _ChildMappingVisitor(ast.NodeVisitor):
                                                           attr='cuda',
                                                           ctx=ast.Load()),
                                        args=[ast.Num(n=device_id)],
-                                       keywords=[], starargs=None, kwargs=None)
+                                       keywords=[ast.keyword(arg='non_blocking',
+                                                             value=ast.NameConstant(value=True))], starargs=None, kwargs=None)
                               if isinstance(arg, ast.Name) and
                               arg.id in self.data else arg for arg in node.args ]
 
-        
+            # attr is not in layer_gpus, traversal the function to modify
+            elif value.id == 'self':
+                func = getattr(self.module, attr)
+
+                # save the func
+                self.old_functions[attr] = copy.deepcopy(func)
+                
+                source = textwrap.dedent(inspect.getsource(func))
+                tree = ast.parse(source)
+
+                # shouldn't modify the return
+                self.no_modify_return=True
+                ast.NodeVisitor.generic_visit(self, tree)
+                ast.fix_missing_locations(tree)
+                self.no_modify_return=False
+
+                name = func.__name__
+                code = compile(tree, filename="<ast>_" + name, mode="exec")
+
+                namespace = self.module.forward.__globals__
+                exec(code, namespace)
+
+                setattr(self.module, attr, types.MethodType(namespace[attr], self.module))
+
 class _FineGrainedMappingVisitor(ast.NodeVisitor):
     def __init__(self, output_device=None, layer_gpus=OrderedDict(), operator_gpus=OrderedDict(), focus_operator=False):
         super(_FineGrainedMappingVisitor)
@@ -101,7 +135,8 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
                                                 attr='cuda',
                                                 ctx=ast.Load()),
                              args=[ast.Num(n=device_id)],
-                             keywords=[], starargs=None, kwargs=None)
+                             keywords=[ast.keyword(arg='non_blocking',
+                                                   value=ast.NameConstant(value=True))], starargs=None, kwargs=None)
 
             target = ast.Name(id=arg_name, ctx=ast.Store())
             assignment = ast.Assign(targets=[target], value=value)
@@ -168,6 +203,7 @@ class DataFlow(Module):
                 self.layer_gpus[n] = self.output_device
 
         self.old_forward = copy.deepcopy(self.module.forward)
+        self.old_functions = {}
 
 
     def _modify_forward(self, visitor, name, module):
@@ -189,6 +225,9 @@ class DataFlow(Module):
         
     def update_flow(self):
         self.module.forward = self.old_forward
+
+        for attr in self.old_functions:
+            setattr(self.module, attr, self.old_functions[attr])
         
         if self.fine_grained:
             for n, m in self.module.named_modules():
@@ -197,6 +236,7 @@ class DataFlow(Module):
                     m.forward = self.old_forwards[n]
                     m.cuda(self.operator_gpus[type(m).__name__] \
                            if self.focus_operator else self.layer_gpus[n])
+
         else:
             # update the submodule gpus
             for n, m in self.module.named_children():
@@ -229,8 +269,10 @@ class DataFlow(Module):
 
             namespace['torch'].cat = copy.deepcopy(torch_cat)
                 
-        cv = _ChildMappingVisitor(layer_gpus=self.layer_gpus,
-                                  output_device=self.output_device)
+        cv = _ChildMappingVisitor(module=self.module, layer_gpus=self.layer_gpus,
+                                  output_device=self.output_device, is_fine=self.fine_grained,
+                                  old_functions = self.old_functions)
+        
         self.module.forward = self._modify_forward(cv, "main", self.module)
 
     def forward(self, *inputs, **kwargs):
