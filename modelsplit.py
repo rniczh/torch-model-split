@@ -4,6 +4,8 @@ import ast
 import inspect
 import copy
 import textwrap
+import functools
+
 
 import torch
 from torch.nn.modules import Module
@@ -12,6 +14,22 @@ from torch._utils import (
     _get_available_device_type,
     _get_device_index,
 )
+
+
+def timer(func):
+    @functools.wraps(func)
+    def wrapper_timer(*args, **kwargs):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        value = func(*args, **kwargs)
+        end.record()
+        torch.cuda.synchronize()
+        elapsed_time = start.elapsed_time(end)
+        func_name = func.__self__.__class__.__name__
+        print(f"Elapsed time: {elapsed_time:0.4f} ms [{func_name}]")
+        return value
+    return wrapper_timer
 
 class _ChildMappingVisitor(ast.NodeVisitor):
     def __init__(self, module=None, output_device=None, layer_gpus=OrderedDict(), is_fine=False, old_functions={}):
@@ -205,6 +223,8 @@ class DataFlow(Module):
         self.old_forward = copy.deepcopy(self.module.forward)
         self.old_functions = {}
 
+        self._time = False
+
 
     def _modify_forward(self, visitor, name, module):
         # get the forward source code and convert it into AST
@@ -223,7 +243,7 @@ class DataFlow(Module):
         return types.MethodType(namespace['forward'], module)
 
         
-    def update_flow(self):
+    def update_flow(self, prof_time=False):
         self.module.forward = self.old_forward
 
         for attr in self.old_functions:
@@ -240,6 +260,8 @@ class DataFlow(Module):
         else:
             # update the submodule gpus
             for n, m in self.module.named_children():
+                if prof_time:
+                    m.forward = timer(m.forward)
                 m.cuda(self.layer_gpus[n])
 
         if self.clear_cache:
