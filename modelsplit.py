@@ -5,7 +5,7 @@ import inspect
 import copy
 import textwrap
 import functools
-
+import astunparse
 
 import torch
 from torch.nn.modules import Module
@@ -32,15 +32,17 @@ def timer(func):
     return wrapper_timer
 
 class _ChildMappingVisitor(ast.NodeVisitor):
-    def __init__(self, module=None, output_device=None, layer_gpus=OrderedDict(), is_fine=False, old_functions={}):
+    def __init__(self, module=None, output_device=None, layer_gpus=OrderedDict(), is_fine=False, old_functions={}, update_function=True, no_modify_return=False):
         super(_ChildMappingVisitor)
         self.layer_gpus = layer_gpus
         self.output_device = output_device
         self.data = set()
         self.module = module
         self.is_fine = is_fine
-        self.no_modify_return=False
+        self.no_modify_return=no_modify_return
         self.old_functions = old_functions
+        self.modified = False
+        self.update_function = update_function
 
     def visit_Return(self, node):
         ast.NodeVisitor.generic_visit(self, node)
@@ -102,13 +104,12 @@ class _ChildMappingVisitor(ast.NodeVisitor):
                               if isinstance(arg, ast.Name) and
                               arg.id in self.data else arg for arg in node.args ]
 
+                self.modified = True
+
             # attr is not in layer_gpus, traversal the function to modify
-            elif value.id == 'self':
+            elif value.id == 'self' and self.update_function:
                 func = getattr(self.module, attr)
 
-                # save the func
-                self.old_functions[attr] = copy.deepcopy(func)
-                
                 source = textwrap.dedent(inspect.getsource(func))
                 tree = ast.parse(source)
 
@@ -118,13 +119,20 @@ class _ChildMappingVisitor(ast.NodeVisitor):
                 ast.fix_missing_locations(tree)
                 self.no_modify_return=False
 
-                name = func.__name__
-                code = compile(tree, filename="<ast>_" + name, mode="exec")
 
-                namespace = self.module.forward.__globals__
-                exec(code, namespace)
+                if self.modified:
+                    # save the func
+                    self.old_functions[attr] = copy.deepcopy(func)
+                    
+                    name = func.__name__
+                    code = compile(tree, filename="<ast>_" + name, mode="exec")
+                    
+                    namespace = self.module.forward.__globals__
+                    exec(code, namespace)
+                    setattr(self.module, attr, types.MethodType(namespace[attr], self.module))
 
-                setattr(self.module, attr, types.MethodType(namespace[attr], self.module))
+                    self.modified = False
+
 
 class _FineGrainedMappingVisitor(ast.NodeVisitor):
     def __init__(self, output_device=None, layer_gpus=OrderedDict(), operator_gpus=OrderedDict(), focus_operator=False):
@@ -195,6 +203,7 @@ class DataFlow(Module):
         self.clear_cache = clear_cache
         self.fine_grained = fine_grained
         self.focus_operator = focus_operator
+        self.submodule_updated = False
 
         # because inference only, so disable the gradient in model
         if inference_only:
@@ -223,9 +232,27 @@ class DataFlow(Module):
         self.old_forward = copy.deepcopy(self.module.forward)
         self.old_functions = {}
 
+
         self._time = False
 
 
+    def _modify_function(self, visitor, attr, func):
+        # get the forward source code and convert it into AST
+        source = textwrap.dedent(inspect.getsource(self.old_functions[attr]))
+        tree = ast.parse(source)
+
+        # udpate the AST
+        visitor.visit(tree)
+        ast.fix_missing_locations(tree)
+
+        # recompile
+        name = func.__name__
+        code = compile(tree, filename="<ast>_" + name, mode="exec")
+        namespace = self.module.forward.__globals__
+        exec(code, namespace)
+
+        return types.MethodType(namespace[attr], self.module)
+    
     def _modify_forward(self, visitor, name, module):
         # get the forward source code and convert it into AST
         source = textwrap.dedent(inspect.getsource(module.forward))
@@ -234,7 +261,7 @@ class DataFlow(Module):
         # udpate the AST
         visitor.visit(tree)
         ast.fix_missing_locations(tree)
-        
+
         # recompile
         code = compile(tree, filename="<ast>_" + name, mode="exec")
         namespace = module.forward.__globals__
@@ -242,12 +269,11 @@ class DataFlow(Module):
 
         return types.MethodType(namespace['forward'], module)
 
-        
     def update_flow(self, prof_time=False):
         self.module.forward = self.old_forward
 
-        for attr in self.old_functions:
-            setattr(self.module, attr, self.old_functions[attr])
+        # for attr in self.old_functions:
+        #     setattr(self.module, attr, self.old_functions[attr])
         
         if self.fine_grained:
             for n, m in self.module.named_modules():
@@ -290,12 +316,24 @@ class DataFlow(Module):
                 return copy_cat(arg, *args)
 
             namespace['torch'].cat = copy.deepcopy(torch_cat)
-                
+
         cv = _ChildMappingVisitor(module=self.module, layer_gpus=self.layer_gpus,
-                                  output_device=self.output_device, is_fine=self.fine_grained,
-                                  old_functions = self.old_functions)
-        
+                                  output_device=self.output_device,
+                                  is_fine=self.fine_grained,
+                                  old_functions = self.old_functions,
+                                  update_function = False if self.fine_grained or self.submodule_updated else True,
+                                  no_modify_return = True if self.submodule_updated else False)
+
+
+        if self.submodule_updated:
+            # only update the old_functions
+            for attr in self.old_functions:
+                func = getattr(self.module, attr)
+                setattr(self.module, attr, self._modify_function(cv, attr, func))
+            
+        cv.no_modify_return = False
         self.module.forward = self._modify_forward(cv, "main", self.module)
+        self.submodule_updated = True
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
