@@ -5,7 +5,6 @@ import inspect
 import copy
 import textwrap
 import functools
-import astunparse
 
 import torch
 from torch.nn.modules import Module
@@ -91,6 +90,7 @@ class _ChildMappingVisitor(ast.NodeVisitor):
             if (value.id == 'self' and
                 attr in self.layer_gpus and
                 isinstance(value.ctx, ast.Load)):
+
                 # get the layer device id
                 device_id = self.layer_gpus[attr]
 
@@ -179,7 +179,7 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
 
         
 class DataFlow(Module):
-    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True, fine_grained=False, focus_operator=False):
+    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True, fine_grained=False, focus_operator=False, enable_clone=False):
         super(DataFlow, self).__init__()
 
         device_type = _get_available_device_type()
@@ -204,6 +204,7 @@ class DataFlow(Module):
         self.fine_grained = fine_grained
         self.focus_operator = focus_operator
         self.submodule_updated = False
+        self.enable_clone = enable_clone
 
         # because inference only, so disable the gradient in model
         if inference_only:
@@ -232,8 +233,17 @@ class DataFlow(Module):
         self.old_forward = copy.deepcopy(self.module.forward)
         self.old_functions = {}
 
-
         self._time = False
+
+        self.clone_modules = {}
+        for i in self.device_ids:
+            self.clone_modules[i] = {}
+
+        if self.enable_clone:
+            for device_id in self.device_ids:
+                for n, m in self.module.named_children():
+                    self.clone_modules[device_id][n] = copy.deepcopy(m)
+                
 
 
     def _modify_function(self, visitor, attr, func):
@@ -280,15 +290,29 @@ class DataFlow(Module):
                 # terminal
                 if len(m._modules) == 0:
                     m.forward = self.old_forwards[n]
+                    if prof_time:
+                        m.forward = timer(m.forward)
                     m.cuda(self.operator_gpus[type(m).__name__] \
                            if self.focus_operator else self.layer_gpus[n])
 
         else:
             # update the submodule gpus
-            for n, m in self.module.named_children():
-                if prof_time:
-                    m.forward = timer(m.forward)
-                m.cuda(self.layer_gpus[n])
+            if self.enable_clone:
+                mms = list(self.module._modules.items())
+                i = 0
+                for n, m in mms:
+                    if prof_time:
+                        m.forward = timer(m.forward)
+                    device_id = self.layer_gpus[n]
+                    self.module._modules[n] = self.clone_modules[device_id][n].cuda(device_id)
+                    i += 1
+            else:
+
+                for n, m in self.module.named_children():
+                    if prof_time:
+                        m.forward = timer(m.forward)
+                    
+                    m.cuda(self.layer_gpus[n])
 
         if self.clear_cache:
             torch.cuda.empty_cache()
@@ -337,3 +361,6 @@ class DataFlow(Module):
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
+
+
+        
