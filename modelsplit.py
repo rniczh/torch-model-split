@@ -39,6 +39,7 @@ class _ChildMappingVisitor(ast.NodeVisitor):
         self.module = module
         self.is_fine = is_fine
         self.no_modify_return=no_modify_return
+        self.no_modify_call = False
         self.old_functions = old_functions
         self.modified = False
         self.update_function = update_function
@@ -75,8 +76,9 @@ class _ChildMappingVisitor(ast.NodeVisitor):
     def visit_Call(self, node):
         ast.NodeVisitor.generic_visit(self, node)
 
-        if self.is_fine:
-            return 
+        if self.no_modify_call or self.is_fine:
+            return
+
         # processing self.layer(arg ...) => self.layer(arg.cuda(device_id) ...)
 
         func = node.func
@@ -179,7 +181,7 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
 
         
 class DataFlow(Module):
-    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True, fine_grained=False, focus_operator=False, enable_clone=False):
+    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True, fine_grained=False, focus_operator=False, enable_clone=False, prof_time=False):
         super(DataFlow, self).__init__()
 
         device_type = _get_available_device_type()
@@ -227,7 +229,10 @@ class DataFlow(Module):
                     self.layer_gpus[n] = self.output_device
             
         else:
+            self.old_forwards = {}
             for n, m in self.module.named_children():
+                if self.enable_clone:
+                    self.old_forwards[n] = copy.deepcopy(m.forward)
                 self.layer_gpus[n] = self.output_device
 
         self.old_forward = copy.deepcopy(self.module.forward)
@@ -239,22 +244,25 @@ class DataFlow(Module):
         for i in self.device_ids:
             self.clone_modules[i] = {}
 
+
         if self.enable_clone:
             if not self.fine_grained:
                 for device_id in self.device_ids:
+                    self.layer_gpus = OrderedDict([(n, device_id) for n in self.layer_gpus])
+                    self._update_flow(prof_time=prof_time)
                     for n, m in self.module.named_children():
                         self.clone_modules[device_id][n] = copy.deepcopy(m)
                         self.clone_modules[device_id][n].cuda(device_id)
-
-                
+                        
             else:
                 for device_id in self.device_ids:
+                    self.layer_gpus = OrderedDict([(n, device_id) for n in self.layer_gpus])
+                    self._update_flow(prof_time=prof_time)
                     for n, m in self.module.named_modules():
                         if len(m._modules) == 0:
                             self.clone_modules[device_id][n] = copy.deepcopy(m)
                             self.clone_modules[device_id][n].cuda(device_id)
-                        
-                            
+
 
 
     def _modify_function(self, visitor, attr, func):
@@ -286,48 +294,40 @@ class DataFlow(Module):
         # recompile
         code = compile(tree, filename="<ast>_" + name, mode="exec")
         namespace = module.forward.__globals__
+
         exec(code, namespace)
 
         return types.MethodType(namespace['forward'], module)
 
     def update_flow(self, prof_time=False):
-        self.module.forward = self.old_forward
-
-        # for attr in self.old_functions:
-        #     setattr(self.module, attr, self.old_functions[attr])
-        
-        if self.fine_grained:
-            if self.enable_clone:
-                mms = list(self.module.named_modules())
-                for n, m in mms:
+        if self.enable_clone:
+            cv = _ChildMappingVisitor(module=self.module, layer_gpus=self.layer_gpus,
+                                      output_device=self.output_device,
+                                      is_fine=self.fine_grained,
+                                      old_functions = self.old_functions,
+                                      update_function = False if self.fine_grained or self.submodule_updated else True,
+                                      no_modify_return = True if self.submodule_updated else False)
+            if self.fine_grained:
+                for n, m in self.module.named_modules():
                     # terminal
                     if len(m._modules) == 0:
-                        m.forward = self.old_forwards[n]
                         device_id = self.operator_gpus[type(m).__name__] \
                                     if self.focus_operator else self.layer_gpus[n]
-                        cloned =  self.clone_modules[device_id][n]
 
+                        cloned =  self.clone_modules[device_id][n]
                         m._parameters = cloned._parameters
                         m._buffers = cloned._buffers
                         m._non_persistent_buffers_set = cloned._non_persistent_buffers_set
                         m._modules = cloned._modules
-                            
+                        if prof_time:
+                            m.forward = timer(cloned.forward)
+                        else:
+                            m.forward = cloned.forward
+
             else:
-                for n, m in self.module.named_modules():
-                    # terminal
-                    if len(m._modules) == 0:
-                        m.forward = self.old_forwards[n]
-                        m.cuda(self.operator_gpus[type(m).__name__] \
-                               if self.focus_operator else self.layer_gpus[n])
-
-        else:
-            # update the submodule gpus
-            if self.enable_clone:
-                mms = list(self.module._modules.items())
-
-                for n, m in mms:
-                    if prof_time:
-                        m.forward = timer(m.forward)
+                for n, m in self.module.named_children():
+                    # if prof_time:
+                    #     m.forward = timer(m.forward)
                     device_id = self.layer_gpus[n]
                     cloned =  self.clone_modules[device_id][n]
 
@@ -335,13 +335,36 @@ class DataFlow(Module):
                     m._buffers = cloned._buffers
                     m._non_persistent_buffers_set = cloned._non_persistent_buffers_set
                     m._modules = cloned._modules
-
-            else:
-                for n, m in self.module.named_children():
                     if prof_time:
-                        m.forward = timer(m.forward)
+                        m.forward = timer(cloned.forward)
+                    else:
+                        m.forward = cloned.forward
                         
-                    m.cuda(self.layer_gpus[n])
+                        
+        else:
+            self._update_flow(prof_time=prof_time)
+    
+    def _update_flow(self, prof_time=False):
+        self.module.forward = self.old_forward
+
+        # for attr in self.old_functions:
+        #     setattr(self.module, attr, self.old_functions[attr])
+        
+        if self.fine_grained:
+            for n, m in self.module.named_modules():
+                # terminal
+                if len(m._modules) == 0:
+                    m.forward = self.old_forwards[n]
+                    m.cuda(self.operator_gpus[type(m).__name__] \
+                           if self.focus_operator else self.layer_gpus[n])
+
+        else:
+            for n, m in self.module.named_children():
+                if self.enable_clone:
+                    m.forward = self.old_forwards[n]
+                elif prof_time:
+                    m.forward = timer(m.forward)
+                m.cuda(self.layer_gpus[n])
 
         if self.clear_cache:
             torch.cuda.empty_cache()
@@ -358,18 +381,23 @@ class DataFlow(Module):
                     continue
                 fv.instance_name = n
                 fv.instance_type = type(m).__name__
-                m.forward = self._modify_forward(fv, n, m)
+
+                if prof_time and not self.enable_clone:
+                    m.forward = timer(self._modify_forward(fv, n, m))
+                else:
+                    m.forward = self._modify_forward(fv, n, m)
+                    
+                    
+        # modify torch.cat
+        namespace = self.module.forward.__globals__
+        copy_cat = copy.deepcopy(namespace['torch'].cat)
                 
+        def torch_cat(arg, *args):
+            first_device_id = arg[0].device
+            arg = [x.to(first_device_id) for x in arg]
+            return copy_cat(arg, *args)
 
-            # modify torch.cat
-            namespace = self.module.forward.__globals__
-            copy_cat = copy.deepcopy(namespace['torch'].cat)
-
-            def torch_cat(arg, *args):
-                arg = [x.cuda(self.output_device) for x in arg]
-                return copy_cat(arg, *args)
-
-            namespace['torch'].cat = copy.deepcopy(torch_cat)
+        namespace['torch'].cat = copy.deepcopy(torch_cat)
 
         cv = _ChildMappingVisitor(module=self.module, layer_gpus=self.layer_gpus,
                                   output_device=self.output_device,
@@ -378,13 +406,27 @@ class DataFlow(Module):
                                   update_function = False if self.fine_grained or self.submodule_updated else True,
                                   no_modify_return = True if self.submodule_updated else False)
 
-
-        if self.submodule_updated:
+        
+        if self.submodule_updated and not self.enable_clone:
             # only update the old_functions
             for attr in self.old_functions:
                 func = getattr(self.module, attr)
                 setattr(self.module, attr, self._modify_function(cv, attr, func))
-            
+
+        
+        if self.enable_clone and not self.fine_grained:
+            # update each module's forward under named_children() instead
+            # using fine grained visitor to update
+            fv = _FineGrainedMappingVisitor(layer_gpus=self.layer_gpus,
+                                            output_device=self.output_device,
+                                            focus_operator=False)
+
+            for n, m in self.module.named_children():
+                fv.instance_name = n
+                m.forward = self._modify_forward(fv, n, m)
+
+        if self.enable_clone:
+            cv.no_modify_call = True
         cv.no_modify_return = False
         self.module.forward = self._modify_forward(cv, "main", self.module)
         self.submodule_updated = True
