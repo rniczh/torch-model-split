@@ -240,10 +240,21 @@ class DataFlow(Module):
             self.clone_modules[i] = {}
 
         if self.enable_clone:
-            for device_id in self.device_ids:
-                for n, m in self.module.named_children():
-                    self.clone_modules[device_id][n] = copy.deepcopy(m)
+            if not self.fine_grained:
+                for device_id in self.device_ids:
+                    for n, m in self.module.named_children():
+                        self.clone_modules[device_id][n] = copy.deepcopy(m)
+                        self.clone_modules[device_id][n].cuda(device_id)
+
                 
+            else:
+                for device_id in self.device_ids:
+                    for n, m in self.module.named_modules():
+                        if len(m._modules) == 0:
+                            self.clone_modules[device_id][n] = copy.deepcopy(m)
+                            self.clone_modules[device_id][n].cuda(device_id)
+                        
+                            
 
 
     def _modify_function(self, visitor, attr, func):
@@ -286,32 +297,50 @@ class DataFlow(Module):
         #     setattr(self.module, attr, self.old_functions[attr])
         
         if self.fine_grained:
-            for n, m in self.module.named_modules():
-                # terminal
-                if len(m._modules) == 0:
-                    m.forward = self.old_forwards[n]
-                    if prof_time:
-                        m.forward = timer(m.forward)
-                    m.cuda(self.operator_gpus[type(m).__name__] \
-                           if self.focus_operator else self.layer_gpus[n])
+            if self.enable_clone:
+                mms = list(self.module.named_modules())
+                for n, m in mms:
+                    # terminal
+                    if len(m._modules) == 0:
+                        m.forward = self.old_forwards[n]
+                        device_id = self.operator_gpus[type(m).__name__] \
+                                    if self.focus_operator else self.layer_gpus[n]
+                        cloned =  self.clone_modules[device_id][n]
+
+                        m._parameters = cloned._parameters
+                        m._buffers = cloned._buffers
+                        m._non_persistent_buffers_set = cloned._non_persistent_buffers_set
+                        m._modules = cloned._modules
+                            
+            else:
+                for n, m in self.module.named_modules():
+                    # terminal
+                    if len(m._modules) == 0:
+                        m.forward = self.old_forwards[n]
+                        m.cuda(self.operator_gpus[type(m).__name__] \
+                               if self.focus_operator else self.layer_gpus[n])
 
         else:
             # update the submodule gpus
             if self.enable_clone:
                 mms = list(self.module._modules.items())
-                i = 0
+
                 for n, m in mms:
                     if prof_time:
                         m.forward = timer(m.forward)
                     device_id = self.layer_gpus[n]
-                    self.module._modules[n] = self.clone_modules[device_id][n].cuda(device_id)
-                    i += 1
-            else:
+                    cloned =  self.clone_modules[device_id][n]
 
+                    m._parameters = cloned._parameters
+                    m._buffers = cloned._buffers
+                    m._non_persistent_buffers_set = cloned._non_persistent_buffers_set
+                    m._modules = cloned._modules
+
+            else:
                 for n, m in self.module.named_children():
                     if prof_time:
                         m.forward = timer(m.forward)
-                    
+                        
                     m.cuda(self.layer_gpus[n])
 
         if self.clear_cache:
@@ -323,13 +352,14 @@ class DataFlow(Module):
                                             output_device=self.output_device,
                                             focus_operator=self.focus_operator)
 
+
             for n, m in self.module.named_modules():
                 if not n or len(m._modules) != 0:
                     continue
-
                 fv.instance_name = n
                 fv.instance_type = type(m).__name__
                 m.forward = self._modify_forward(fv, n, m)
+                
 
             # modify torch.cat
             namespace = self.module.forward.__globals__
