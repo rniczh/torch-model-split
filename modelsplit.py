@@ -5,6 +5,7 @@ import inspect
 import copy
 import textwrap
 import functools
+import sys
 
 import torch
 from torch.nn.modules import Module
@@ -262,7 +263,7 @@ class DataFlow(Module):
                         if len(m._modules) == 0:
                             self.clone_modules[device_id][n] = copy.deepcopy(m)
                             self.clone_modules[device_id][n].cuda(device_id)
-
+                            
 
 
     def _modify_function(self, visitor, attr, func):
@@ -299,14 +300,16 @@ class DataFlow(Module):
 
         return types.MethodType(namespace['forward'], module)
 
+    def construct_module(self):
+        if self.enable_clone:
+            return copy.deepcopy(self.module)
+        else:
+            print('You need to enable the clone by enable_clone option', file=sys.stderr)
+            return None
+            
+    
     def update_flow(self, prof_time=False):
         if self.enable_clone:
-            cv = _ChildMappingVisitor(module=self.module, layer_gpus=self.layer_gpus,
-                                      output_device=self.output_device,
-                                      is_fine=self.fine_grained,
-                                      old_functions = self.old_functions,
-                                      update_function = False if self.fine_grained or self.submodule_updated else True,
-                                      no_modify_return = True if self.submodule_updated else False)
             if self.fine_grained:
                 for n, m in self.module.named_modules():
                     # terminal
