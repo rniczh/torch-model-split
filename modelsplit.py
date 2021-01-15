@@ -15,6 +15,7 @@ from torch._utils import (
     _get_device_index,
 )
 
+
 def timer(func):
     @functools.wraps(func)
     def wrapper_timer(*args, **kwargs):
@@ -179,9 +180,8 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
             if isinstance(t, ast.Name):
                 self.data.add(t.id)
 
-
 class DataFlow(Module):
-    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=False, fine_grained=False, focus_operator=False, enable_clone=False, prof_time=False):
+    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True, fine_grained=False, focus_operator=False, enable_clone=False, prof_time=False):
         super(DataFlow, self).__init__()
 
         device_type = _get_available_device_type()
@@ -300,17 +300,23 @@ class DataFlow(Module):
 
         return types.MethodType(namespace['forward'], module)
 
-    def construct_module(self, layer_gpus, copy=True, module=None):
+    def construct_module(self, layer_gpus=None, module=None):
         # construct the model by giving the layer_gpus table
         if self.enable_clone:
+            if not layer_gpus:
+                layer_gpus = self.layer_gpus
+
             # update the argument module
             if module:
                 # backup
                 tmp_m = self.module
                 tmp_l = self.layer_gpus
 
+                # prepare
                 self.module = module
                 self.layer_gpus = layer_gpus
+
+                # update flow
                 self.update_flow()
                 ret = self.module
 
@@ -320,23 +326,25 @@ class DataFlow(Module):
                 return ret
 
             # copy the model
-            if copy:
+            else:
                 # backup
                 tmp_m = copy.deepcopy(self.module)
                 tmp_l = self.layer_gpus
 
+                # update flow
                 self.layer_gpus = layer_gpus
                 self.update_flow()
-                ret = copy.deepcopy(self.module)
+                ret = self.module
 
                 # restore
                 self.module = tmp_m
                 self.layer_gpus = tmp_l
+
                 return ret
 
-            return copy.deepcopy(self.module)
         else:
-            print('You need to enable the clone by enable_clone option', file=sys.stderr)
+            print('You need to enable the clone by enable_clone option',
+                  file=sys.stderr)
             return None
 
 
