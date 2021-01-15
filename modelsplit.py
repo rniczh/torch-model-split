@@ -15,7 +15,6 @@ from torch._utils import (
     _get_device_index,
 )
 
-
 def timer(func):
     @functools.wraps(func)
     def wrapper_timer(*args, **kwargs):
@@ -60,7 +59,7 @@ class _ChildMappingVisitor(ast.NodeVisitor):
                          keywords=[ast.keyword(arg='non_blocking',
                                                value=ast.NameConstant(value=True))], starargs=None, kwargs=None)
         node.value = value
-        
+
     def visit_FunctionDef(self, node):
         for arg in node.args.args:
             if arg.arg != 'self':
@@ -126,10 +125,10 @@ class _ChildMappingVisitor(ast.NodeVisitor):
                 if self.modified:
                     # save the func
                     self.old_functions[attr] = copy.deepcopy(func)
-                    
+
                     name = func.__name__
                     code = compile(tree, filename="<ast>_" + name, mode="exec")
-                    
+
                     namespace = self.module.forward.__globals__
                     exec(code, namespace)
                     setattr(self.module, attr, types.MethodType(namespace[attr], self.module))
@@ -157,7 +156,7 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
             device_id = self.operator_gpus[self.instance_type] \
                         if self.focus_operator \
                            else self.layer_gpus[self.instance_name]
-                
+
             value = ast.Call(func=ast.Attribute(value=
                                                 ast.Name(id=arg_name,
                                                          ctx=ast.Load()),
@@ -180,7 +179,7 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
             if isinstance(t, ast.Name):
                 self.data.add(t.id)
 
-        
+
 class DataFlow(Module):
     def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True, fine_grained=False, focus_operator=False, enable_clone=False, prof_time=False):
         super(DataFlow, self).__init__()
@@ -228,7 +227,7 @@ class DataFlow(Module):
                     self.old_forwards[n] = copy.deepcopy(m.forward)
                     self.operator_gpus[type(m).__name__] = self.output_device
                     self.layer_gpus[n] = self.output_device
-            
+
         else:
             self.old_forwards = {}
             for n, m in self.module.named_children():
@@ -254,7 +253,7 @@ class DataFlow(Module):
                     for n, m in self.module.named_children():
                         self.clone_modules[device_id][n] = copy.deepcopy(m)
                         self.clone_modules[device_id][n].cuda(device_id)
-                        
+
             else:
                 for device_id in self.device_ids:
                     self.layer_gpus = OrderedDict([(n, device_id) for n in self.layer_gpus])
@@ -263,7 +262,7 @@ class DataFlow(Module):
                         if len(m._modules) == 0:
                             self.clone_modules[device_id][n] = copy.deepcopy(m)
                             self.clone_modules[device_id][n].cuda(device_id)
-                            
+
 
 
     def _modify_function(self, visitor, attr, func):
@@ -282,7 +281,7 @@ class DataFlow(Module):
         exec(code, namespace)
 
         return types.MethodType(namespace[attr], self.module)
-    
+
     def _modify_forward(self, visitor, name, module):
         # get the forward source code and convert it into AST
         source = textwrap.dedent(inspect.getsource(module.forward))
@@ -319,7 +318,7 @@ class DataFlow(Module):
                 self.module = tmp_m
                 self.layer_gpus = tmp_l
                 return ret
-            
+
             # copy the model
             if copy:
                 # backup
@@ -339,8 +338,8 @@ class DataFlow(Module):
         else:
             print('You need to enable the clone by enable_clone option', file=sys.stderr)
             return None
-            
-    
+
+
     def update_flow(self, prof_time=False):
         if self.enable_clone:
             if self.fine_grained:
@@ -375,17 +374,17 @@ class DataFlow(Module):
                         m.forward = timer(cloned.forward)
                     else:
                         m.forward = cloned.forward
-                        
-                        
+
+
         else:
             self._update_flow(prof_time=prof_time)
-    
+
     def _update_flow(self, prof_time=False):
         self.module.forward = self.old_forward
 
         # for attr in self.old_functions:
         #     setattr(self.module, attr, self.old_functions[attr])
-        
+
         if self.fine_grained:
             for n, m in self.module.named_modules():
                 # terminal
@@ -422,12 +421,12 @@ class DataFlow(Module):
                     m.forward = timer(self._modify_forward(fv, n, m))
                 else:
                     m.forward = self._modify_forward(fv, n, m)
-                    
-                    
+
+
         # modify torch.cat
         namespace = self.module.forward.__globals__
         copy_cat = copy.deepcopy(namespace['torch'].cat)
-                
+
         def torch_cat(arg, *args):
             first_device_id = arg[0].device
             arg = [x.to(first_device_id) for x in arg]
@@ -442,14 +441,14 @@ class DataFlow(Module):
                                   update_function = False if self.fine_grained or self.submodule_updated else True,
                                   no_modify_return = True if self.submodule_updated else False)
 
-        
+
         if self.submodule_updated and not self.enable_clone:
             # only update the old_functions
             for attr in self.old_functions:
                 func = getattr(self.module, attr)
                 setattr(self.module, attr, self._modify_function(cv, attr, func))
 
-        
+
         if self.enable_clone and not self.fine_grained:
             # update each module's forward under named_children() instead
             # using fine grained visitor to update
@@ -469,6 +468,3 @@ class DataFlow(Module):
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
-
-
-        
