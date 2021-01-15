@@ -181,7 +181,7 @@ class _FineGrainedMappingVisitor(ast.NodeVisitor):
 
 
 class DataFlow(Module):
-    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=True, fine_grained=False, focus_operator=False, enable_clone=False, prof_time=False):
+    def __init__(self, module, device_ids=None, output_device=None, dim=0, inference_only=False, clear_cache=False, fine_grained=False, focus_operator=False, enable_clone=False, prof_time=False):
         super(DataFlow, self).__init__()
 
         device_type = _get_available_device_type()
