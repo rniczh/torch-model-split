@@ -286,6 +286,7 @@ class DataFlow(Module):
     def _modify_forward(self, visitor, name, module):
         # get the forward source code and convert it into AST
         source = textwrap.dedent(inspect.getsource(module.forward))
+
         tree = ast.parse(source)
 
         # udpate the AST
@@ -300,8 +301,40 @@ class DataFlow(Module):
 
         return types.MethodType(namespace['forward'], module)
 
-    def construct_module(self):
+    def construct_module(self, layer_gpus, copy=True, module=None):
+        # construct the model by giving the layer_gpus table
         if self.enable_clone:
+            # update the argument module
+            if module:
+                # backup
+                tmp_m = self.module
+                tmp_l = self.layer_gpus
+
+                self.module = module
+                self.layer_gpus = layer_gpus
+                self.update_flow()
+                ret = self.module
+
+                # restore
+                self.module = tmp_m
+                self.layer_gpus = tmp_l
+                return ret
+            
+            # copy the model
+            if copy:
+                # backup
+                tmp_m = copy.deepcopy(self.module)
+                tmp_l = self.layer_gpus
+
+                self.layer_gpus = layer_gpus
+                self.update_flow()
+                ret = copy.deepcopy(self.module)
+
+                # restore
+                self.module = tmp_m
+                self.layer_gpus = tmp_l
+                return ret
+
             return copy.deepcopy(self.module)
         else:
             print('You need to enable the clone by enable_clone option', file=sys.stderr)
